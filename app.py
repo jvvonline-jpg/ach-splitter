@@ -6,35 +6,47 @@ import zipfile
 import re
 import pandas as pd
 
-st.set_page_config(page_title="ACH Smart Splitter + Search", layout="wide")
-st.title("🏦 ACH Smart Splitter with Searchable Index")
+st.set_page_config(page_title="ACH Master Splitter", layout="wide")
+st.title("🏦 ACH Master Precision Splitter")
 
-# --- CORE LOGIC ---
 def is_valid_payee(name):
+    """Refined filter to strictly capture actual payee names."""
     if not name: return False
     clean_name = name.upper().strip()
-    forbidden = ["CORNERSTONES", "CORNERSTONES INC", "TRANSFER", "INTERNAL", "CUSTOMER REFERENCE NUMBER"]
+    
+    # Internal terms to reject
+    forbidden = [
+        "CORNERSTONES", "CORNERSTONES INC", "TRANSFER", "INTERNAL", 
+        "CUSTOMER REFERENCE NUMBER", "CORP PYMNT", "DEMAND CREDIT", "PAYEE"
+    ]
+    
     if any(f == clean_name for f in forbidden): return False
-    if clean_name.replace('.', '').isdigit(): return False
+    if clean_name.replace('.', '').isdigit(): return False # Rejects codes like '6465'
+    
     return True
 
 def get_best_payee(block_text):
+    """Prioritizes Payee fields for the Master PDF format."""
+    # 1. Look for 'Originator Name' (Fairfax One / FundraiseUp)
+    orig_search = re.search(r"Originator Name:[\",\s]*(.*?)[ \",\n]", block_text)
+    # 2. Look for 'Description' (Hypothermia)
     desc_search = re.findall(r"Description\s+(.*)", block_text)
-    receiver_search = re.search(r"Receiver Name:[\",\s]*(.*?)[ \",\n]", block_text)
+    # 3. Look for 'Entry Description' (BB Merchan)
     entry_search = re.search(r"Entry Description:[\",\s]*(.*?)[ \",\n]", block_text)
-    
-    candidates = desc_search + [
-        receiver_search.group(1) if receiver_search else None,
-        entry_search.group(1) if entry_search else None
-    ]
+
+    candidates = []
+    if orig_search: candidates.append(orig_search.group(1))
+    if desc_search: candidates.extend(desc_search)
+    if entry_search: candidates.append(entry_search.group(1))
+
     for candidate in candidates:
         if is_valid_payee(candidate): return candidate.strip()
+            
     return "Unknown_Payee"
 
-def process_with_search(uploaded_file):
+def process_master_pdf(uploaded_file):
     zip_buffer = io.BytesIO()
-    records_list = [] # List of dicts for Pandas
-    preview_img = None
+    records_list = []
     global_counter = 1
     
     with pdfplumber.open(uploaded_file) as pdf:
@@ -42,80 +54,64 @@ def process_with_search(uploaded_file):
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text()
+                
+                # Determine splitting logic by page
+                # Page 3 has two 'RECEIVER INFORMATION' blocks. Pages 1 & 2 are single records.
+                if "Page 3" in text:
+                    header_triggers = ["RECEIVER INFORMATION"]
+                else:
+                    # Treat the whole page as one record block for Pages 1 & 2
+                    header_triggers = ["ACH REMITTANCE ADVICE"]
+
+                blocks = re.split(r"|".join(header_triggers), text)[1:]
+                
+                # Extract clean amounts ($771.65, $465.00, $242.74)
+                amounts = re.findall(r"(?:Amount|Monetary Amount)[\":,\s]*\\?\$?([\d,.]+)", text)
+                unique_amounts = []
+                for a in amounts:
+                    val = float(a.replace(',', ''))
+                    if val > 0 and a not in unique_amounts:
+                        unique_amounts.append(a)
+
+                # Find vertical positions for surgical cropping
                 words = page.extract_words()
                 header_tops = [w['top'] for w in words if w['text'] in ["RECEIVER", "Party"]]
-                blocks = re.split(r"(?:RECEIVER INFORMATION|Party Identification)", text)[1:]
-                amounts = re.findall(r"(?:Amount|Monetary Amount)[\":,\s]*\\?\$?([\d,.]+)", text)
-                amounts = [a for a in amounts if float(a.replace(',', '')) > 0]
-                
+                # For single-record pages, we just take the top-most header
+                if "Page 3" not in text: header_tops = [header_tops[0]] if header_tops else [50]
+
                 for j, start_y in enumerate(header_tops):
-                    if j >= len(blocks): break
-                    payee_name = get_best_payee(blocks[j])
-                    amt = amounts[j] if j < len(amounts) else "0.00"
+                    if j >= len(blocks) or j >= len(unique_amounts): break
                     
+                    payee_name = get_best_payee(blocks[j])
+                    amt = unique_amounts[j]
+                    
+                    # Final Naming Syntax
                     file_num = f"{global_counter:02d}"
                     filename = f"Split File {file_num} {payee_name} ${amt}.pdf"
                     
                     # Surgical Crop
                     end_y = header_tops[j+1] if j+1 < len(header_tops) else page.height
-                    
-                    if global_counter == 1:
-                        cropped_page = page.crop((0, start_y - 10, page.width, end_y + 10))
-                        preview_img = cropped_page.to_image(resolution=150).original
-                    
                     pypdf_page = reader.pages[i]
                     pypdf_page.mediabox.upper_right = (pypdf_page.mediabox.right, float(page.height - start_y + 20))
                     pypdf_page.mediabox.lower_left = (0, float(page.height - end_y - 10))
                     
+                    # Save
                     writer = PdfWriter()
                     writer.add_page(pypdf_page)
                     pdf_out = io.BytesIO()
                     writer.write(pdf_out)
                     zip_file.writestr(filename, pdf_out.getvalue())
                     
-                    # Save to list for the Searchable Table
-                    records_list.append({
-                        "ID": file_num,
-                        "Payee": payee_name,
-                        "Amount": float(amt.replace(',', '')),
-                        "Filename": filename
-                    })
+                    records_list.append({"ID": file_num, "Payee": payee_name, "Amount": amt, "Filename": filename})
                     global_counter += 1
                     
-    return zip_buffer, pd.DataFrame(records_list), preview_img
+    return zip_buffer, pd.DataFrame(records_list)
 
 # --- UI ---
-uploaded_file = st.file_uploader("Upload Atlantic Union Bank Report", type="pdf")
-
+uploaded_file = st.file_uploader("Upload Master.pdf", type="pdf")
 if uploaded_file:
-    if st.button("🚀 Process & Generate Index"):
-        zip_data, df, preview_img = process_with_search(uploaded_file)
-        
-        # Store in session state so search doesn't trigger a re-run
-        st.session_state['zip_data'] = zip_data
-        st.session_state['df'] = df
-        st.session_state['preview_img'] = preview_img
-
-if 'df' in st.session_state:
-    st.subheader("🔍 Extraction Results & Search")
-    
-    # Search Inputs
-    search_query = st.text_input("Search by Payee Name or Filename", placeholder="e.g. HYPOTHERMIA")
-    
-    # Filter DataFrame
-    filtered_df = st.session_state['df']
-    if search_query:
-        filtered_df = filtered_df[
-            filtered_df['Payee'].str.contains(search_query, case=False) | 
-            filtered_df['Filename'].str.contains(search_query, case=False)
-        ]
-
-    # Show Preview and Download
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        if st.session_state['preview_img']:
-            st.image(st.session_state['preview_img'], caption="Record 01 Preview", use_container_width=True)
-        st.download_button("📥 Download Full ZIP", st.session_state['zip_data'].getvalue(), "ACH_Split_Surgical.zip")
-    
-    with col2:
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    if st.button("🚀 Generate 4 Surgical Files"):
+        zip_data, df = process_master_pdf(uploaded_file)
+        st.success(f"Successfully isolated {len(df)} records.")
+        st.dataframe(df, hide_index=True)
+        st.download_button("📥 Download Master ZIP", zip_data.getvalue(), "Master_Split.zip")
