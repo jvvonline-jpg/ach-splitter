@@ -1,178 +1,13 @@
 import streamlit as st
-import streamlit.components.v1 as components
 from pypdf import PdfReader, PdfWriter
 import io
 import re
 import zipfile
 import fitz  # pymupdf
 import base64
-import os
-import tempfile
+from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(page_title="ACH Remittance Splitter", layout="wide")
-
-# ── Custom component (written to temp dir at runtime for portability) ─────────
-_COMPONENT_HTML = r"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: transparent; }
-  .instructions {
-    font-size: 13px; color: #64748b; padding: 8px 12px; text-align: center;
-    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
-    margin-bottom: 8px; line-height: 1.5;
-  }
-  .instructions strong { color: #334155; }
-  #wrapper {
-    position: relative; display: block; border: 1px solid #e2e8f0;
-    border-radius: 8px; overflow: hidden; background: #fff;
-  }
-  #page-image {
-    display: block; width: 100%; user-select: none;
-    -webkit-user-drag: none; pointer-events: none;
-  }
-  #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
-  .line-count {
-    font-size: 13px; color: #475569; padding: 8px 12px;
-    text-align: center; margin-top: 8px;
-  }
-  .line-count strong { color: #16a34a; }
-</style>
-</head>
-<body>
-<div class="instructions">
-  <strong>Click</strong> anywhere to add a split line &nbsp;&middot;&nbsp;
-  <strong>Drag</strong> a line to move it &nbsp;&middot;&nbsp;
-  <strong>Double-click</strong> a line to remove it
-</div>
-<div id="wrapper">
-  <img id="page-image" />
-  <canvas id="overlay"></canvas>
-</div>
-<div id="line-count" class="line-count"></div>
-<script>
-(function() {
-  var GRAB_THRESHOLD = 12;
-  var lines = [], dragging = null, hoveredLine = -1, lastSentJSON = "", imageLoaded = false;
-  var imgEl = document.getElementById('page-image');
-  var canvas = document.getElementById('overlay');
-  var ctx = canvas.getContext('2d');
-  var lineCountEl = document.getElementById('line-count');
-
-  function drawRoundRect(cx, x, y, w, h, r) {
-    cx.beginPath(); cx.moveTo(x+r,y); cx.lineTo(x+w-r,y);
-    cx.quadraticCurveTo(x+w,y,x+w,y+r); cx.lineTo(x+w,y+h-r);
-    cx.quadraticCurveTo(x+w,y+h,x+w-r,y+h); cx.lineTo(x+r,y+h);
-    cx.quadraticCurveTo(x,y+h,x,y+h-r); cx.lineTo(x,y+r);
-    cx.quadraticCurveTo(x,y,x+r,y); cx.closePath(); cx.fill();
-  }
-  function sendReady() { window.parent.postMessage({type:"streamlit:componentReady",apiVersion:1},"*"); }
-  function sendValue(v) {
-    var j=JSON.stringify(v); if(j===lastSentJSON)return; lastSentJSON=j;
-    window.parent.postMessage({type:"streamlit:setComponentValue",value:v},"*");
-  }
-  function setFrameHeight(h) { window.parent.postMessage({type:"streamlit:setFrameHeight",height:h},"*"); }
-
-  window.addEventListener("message",function(event){
-    if(!event.data||event.data.type!=="streamlit:render")return;
-    var args=event.data.args;
-    lines=args.lines?args.lines.slice():[];
-    lastSentJSON=JSON.stringify(lines);
-    var b64=args.image_b64; if(!b64)return;
-    var newSrc="data:image/png;base64,"+b64;
-    if(imgEl.src!==newSrc){
-      imgEl.onload=function(){
-        imageLoaded=true; resizeCanvas(); drawLines(); updateLineCount();
-        setTimeout(function(){setFrameHeight(document.body.scrollHeight+10);},60);
-      };
-      imgEl.src=newSrc;
-    } else { resizeCanvas(); drawLines(); updateLineCount(); }
-  });
-
-  function resizeCanvas(){if(!imgEl.naturalWidth)return;canvas.width=imgEl.naturalWidth;canvas.height=imgEl.naturalHeight;}
-  function getMouseY(e){var r=canvas.getBoundingClientRect();return(e.clientY-r.top)*(canvas.height/r.height);}
-  function findNearestLine(mouseY){
-    var best=-1,bestDist=Infinity;
-    for(var i=0;i<lines.length;i++){var d=Math.abs(mouseY-lines[i]*canvas.height);if(d<bestDist){bestDist=d;best=i;}}
-    var r=canvas.getBoundingClientRect();
-    return bestDist<=GRAB_THRESHOLD*(canvas.height/r.height)?best:-1;
-  }
-  function drawLines(){
-    if(!imageLoaded)return; ctx.clearRect(0,0,canvas.width,canvas.height);
-    for(var i=0;i<lines.length;i++){
-      var y=lines[i]*canvas.height, isA=(i===hoveredLine)||(i===dragging);
-      ctx.beginPath();ctx.setLineDash([18,10]);
-      ctx.strokeStyle=isA?'#dc2626':'#22c55e';ctx.lineWidth=isA?4:3;
-      ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke();ctx.setLineDash([]);
-      var pct=Math.round(lines[i]*100),label=isA?'\u2715  '+pct+'%':pct+'%';
-      ctx.font='bold 13px -apple-system,BlinkMacSystemFont,sans-serif';
-      var tw=ctx.measureText(label).width,lx=canvas.width-tw-24,ly=y-10;
-      if(ly<4)ly=y+22;
-      ctx.fillStyle=isA?'rgba(220,38,38,0.9)':'rgba(34,197,94,0.9)';
-      drawRoundRect(ctx,lx-6,ly-13,tw+12,20,4);
-      ctx.fillStyle='#fff';ctx.fillText(label,lx,ly+2);
-    }
-  }
-  function updateLineCount(){
-    lineCountEl.innerHTML=lines.length===0?'No split lines on this page. Click on the image to add one.':
-      '<strong>'+lines.length+'</strong> split line'+(lines.length>1?'s':'')+' on this page';
-  }
-
-  var clickStartY=null,didDrag=false;
-  canvas.addEventListener('mousedown',function(e){
-    e.preventDefault();var my=getMouseY(e);clickStartY=my;didDrag=false;
-    var idx=findNearestLine(my);if(idx>=0)dragging=idx;
-  });
-  canvas.addEventListener('mousemove',function(e){
-    e.preventDefault();var my=getMouseY(e);
-    if(dragging!==null){didDrag=true;lines[dragging]=Math.max(0.01,Math.min(0.99,my/canvas.height));canvas.style.cursor='grabbing';drawLines();}
-    else{var idx=findNearestLine(my);hoveredLine=idx;canvas.style.cursor=idx>=0?'ns-resize':'crosshair';drawLines();}
-  });
-  canvas.addEventListener('mouseup',function(e){
-    var my=getMouseY(e);
-    if(dragging!==null){lines.sort(function(a,b){return a-b;});dragging=null;hoveredLine=-1;sendValue(lines.slice());drawLines();updateLineCount();}
-    else if(!didDrag&&clickStartY!==null){var idx=findNearestLine(my);if(idx<0){var yF=Math.max(0.01,Math.min(0.99,my/canvas.height));lines.push(yF);lines.sort(function(a,b){return a-b;});sendValue(lines.slice());drawLines();updateLineCount();}}
-    clickStartY=null;didDrag=false;
-  });
-  canvas.addEventListener('mouseleave',function(e){
-    if(dragging!==null){lines.sort(function(a,b){return a-b;});dragging=null;sendValue(lines.slice());drawLines();updateLineCount();}
-    hoveredLine=-1;canvas.style.cursor='crosshair';drawLines();clickStartY=null;didDrag=false;
-  });
-  canvas.addEventListener('dblclick',function(e){
-    e.preventDefault();var my=getMouseY(e),idx=findNearestLine(my);
-    if(idx>=0){lines.splice(idx,1);hoveredLine=-1;dragging=null;sendValue(lines.slice());drawLines();updateLineCount();}
-  });
-  canvas.addEventListener('contextmenu',function(e){e.preventDefault();});
-
-  var touchStartY=null,touchDragging=null,touchDidDrag=false;
-  function getTouchY(e){var t=e.touches[0]||e.changedTouches[0],r=canvas.getBoundingClientRect();return(t.clientY-r.top)*(canvas.height/r.height);}
-  canvas.addEventListener('touchstart',function(e){e.preventDefault();var my=getTouchY(e);touchStartY=my;touchDidDrag=false;var idx=findNearestLine(my);if(idx>=0){touchDragging=idx;dragging=idx;}},{passive:false});
-  canvas.addEventListener('touchmove',function(e){e.preventDefault();var my=getTouchY(e);if(touchDragging!==null){touchDidDrag=true;lines[touchDragging]=Math.max(0.01,Math.min(0.99,my/canvas.height));dragging=touchDragging;drawLines();}},{passive:false});
-  canvas.addEventListener('touchend',function(e){e.preventDefault();var my=getTouchY(e);if(touchDragging!==null){lines.sort(function(a,b){return a-b;});touchDragging=null;dragging=null;sendValue(lines.slice());drawLines();updateLineCount();}else if(!touchDidDrag&&touchStartY!==null){var idx=findNearestLine(my);if(idx<0){var yF=Math.max(0.01,Math.min(0.99,my/canvas.height));lines.push(yF);lines.sort(function(a,b){return a-b;});sendValue(lines.slice());drawLines();updateLineCount();}}touchStartY=null;touchDidDrag=false;},{passive:false});
-
-  sendReady();
-})();
-</script>
-</body>
-</html>"""
-
-# Write component HTML to a stable temp directory
-_component_dir = os.path.join(tempfile.gettempdir(), "st_split_line_editor")
-os.makedirs(_component_dir, exist_ok=True)
-_index_path = os.path.join(_component_dir, "index.html")
-with open(_index_path, "w") as _f:
-    _f.write(_COMPONENT_HTML)
-
-_split_editor = components.declare_component("split_line_editor", path=_component_dir)
-
-
-def split_editor(image_b64, lines, key=None):
-    """Render the interactive split-line editor. Returns updated list of y-fractions."""
-    return _split_editor(image_b64=image_b64, lines=lines, key=key, default=lines)
-
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -204,6 +39,13 @@ st.markdown("""
     font-size: 13px;
     margin-bottom: 8px;
 }
+.line-row {
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    border-radius: 8px;
+    padding: 6px 12px;
+    margin-bottom: 6px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -223,15 +65,55 @@ def extract_ach_info(text):
     safe_name = "".join([c for c in name if c.isalnum() or c in (" ", "_")]).rstrip()
     return safe_name, amount, trace
 
-# ── Helper: render a PDF page to a base64 PNG ────────────────────────────────
-def render_page(pdf_bytes, page_num, zoom=1.4):
+# ── Helper: render a PDF page to PIL Image ───────────────────────────────────
+def render_page_image(pdf_bytes, page_num, zoom=1.4):
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_num]
     mat  = fitz.Matrix(zoom, zoom)
     pix  = page.get_pixmap(matrix=mat)
-    img_bytes = pix.tobytes("png")
+    img  = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     doc.close()
-    return img_bytes, pix.width, pix.height
+    return img
+
+# ── Helper: draw split lines on image ────────────────────────────────────────
+def draw_lines_on_image(img, y_fracs):
+    """Return a new image with green dashed lines and labels drawn at each y_frac."""
+    overlay = img.copy().convert("RGBA")
+    draw_layer = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(draw_layer)
+
+    for idx, y_frac in enumerate(sorted(y_fracs)):
+        y_px = int(y_frac * img.height)
+        pct  = int(y_frac * 100)
+
+        # Dashed green line
+        dash_len, gap_len = 18, 10
+        x = 0
+        while x < img.width:
+            draw.line(
+                [(x, y_px), (min(x + dash_len, img.width), y_px)],
+                fill=(34, 197, 94, 220), width=3
+            )
+            x += dash_len + gap_len
+
+        # Label background + text
+        label = f" Line {idx+1} — {pct}% "
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        except Exception:
+            font = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        lx = img.width - tw - 16
+        ly = y_px - th - 8
+        if ly < 2:
+            ly = y_px + 6
+        draw.rounded_rectangle([lx - 4, ly - 2, lx + tw + 4, ly + th + 4], radius=4,
+                               fill=(34, 197, 94, 220))
+        draw.text((lx, ly), label, fill=(255, 255, 255, 255), font=font)
+
+    result = Image.alpha_composite(overlay, draw_layer).convert("RGB")
+    return result
 
 # ── Helper: build split PDFs from line positions ──────────────────────────────
 def build_split_pdfs(pdf_bytes, split_points):
@@ -242,12 +124,10 @@ def build_split_pdfs(pdf_bytes, split_points):
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(src)
 
-    # Build list of cut positions: (page_idx, y_frac)
     cuts = sorted(split_points, key=lambda x: (x[0], x[1]))
 
-    # Build segments: each segment is a list of (page_idx, y_start_frac, y_end_frac)
     segments = []
-    seg_start = (0, 0.0)  # (page_idx, y_frac)
+    seg_start = (0, 0.0)
 
     for cut_page, cut_y in cuts:
         segments.append((seg_start, (cut_page, cut_y)))
@@ -264,19 +144,15 @@ def build_split_pdfs(pdf_bytes, split_points):
         writer = PdfWriter()
 
         for p in range(start_page, end_page + 1):
-            page     = reader.pages[p]
-            page_h   = float(page.mediabox.height)
-            page_w   = float(page.mediabox.width)
+            page   = reader.pages[p]
+            page_h = float(page.mediabox.height)
 
             crop_top    = 0.0
             crop_bottom = 0.0
 
             if p == start_page and start_y > 0.0:
-                # crop from top down to start_y
                 crop_top = start_y * page_h
-
             if p == end_page and end_y < 1.0:
-                # crop from end_y to bottom
                 crop_bottom = (1.0 - end_y) * page_h
 
             if crop_top > 0 or crop_bottom > 0:
@@ -289,9 +165,8 @@ def build_split_pdfs(pdf_bytes, split_points):
 
             writer.add_page(page)
 
-        # Try to extract ACH info from first page of segment for naming
         try:
-            seg_text   = reader.pages[start_page].extract_text() or ""
+            seg_text = reader.pages[start_page].extract_text() or ""
             name, amt, trace = extract_ach_info(seg_text)
             filename = f"Split_{seg_idx + 1}_{name}_Amt_{amt}.pdf"
         except Exception:
@@ -307,8 +182,8 @@ def build_split_pdfs(pdf_bytes, split_points):
 if "pdf_bytes"     not in st.session_state: st.session_state.pdf_bytes     = None
 if "total_pages"   not in st.session_state: st.session_state.total_pages   = 0
 if "current_page"  not in st.session_state: st.session_state.current_page  = 0
-if "split_lines"   not in st.session_state: st.session_state.split_lines   = {}  # {page_idx: [y_frac, ...]}
-if "stage"         not in st.session_state: st.session_state.stage         = "upload"  # upload | mark | done
+if "split_lines"   not in st.session_state: st.session_state.split_lines   = {}
+if "stage"         not in st.session_state: st.session_state.stage         = "upload"
 if "split_results" not in st.session_state: st.session_state.split_results = []
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -322,8 +197,8 @@ if st.session_state.stage == "upload":
     if uploaded:
         pdf_bytes = uploaded.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        st.session_state.pdf_bytes   = pdf_bytes
-        st.session_state.total_pages = len(doc)
+        st.session_state.pdf_bytes    = pdf_bytes
+        st.session_state.total_pages  = len(doc)
         st.session_state.current_page = 0
         st.session_state.split_lines  = {}
         doc.close()
@@ -339,12 +214,17 @@ if st.session_state.stage == "upload":
 # ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.stage == "mark":
     st.markdown('<div class="step-badge">Step 2 — Mark split lines</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Use the slider to position a split line, then click <b>Add</b>. '
+        'Move existing lines with their sliders. Remove lines with the <b>✕</b> button.</div>',
+        unsafe_allow_html=True
+    )
 
     pdf_bytes   = st.session_state.pdf_bytes
     total_pages = st.session_state.total_pages
     pg          = st.session_state.current_page
 
-    # Page navigation
+    # ── Page navigation ──────────────────────────────────────────────────────
     col_prev, col_info, col_next = st.columns([1, 3, 1])
     with col_prev:
         if st.button("⬅ Prev", disabled=(pg == 0)):
@@ -361,30 +241,73 @@ elif st.session_state.stage == "mark":
             st.session_state.current_page += 1
             st.rerun()
 
-    # Render current page as base64 PNG
-    img_bytes, img_w, img_h = render_page(pdf_bytes, pg)
-    img_b64 = base64.b64encode(img_bytes).decode()
+    # ── Render page with lines ───────────────────────────────────────────────
+    lines_on_page = sorted(st.session_state.split_lines.get(pg, []))
+    base_img = render_page_image(pdf_bytes, pg)
 
-    # Get current lines for this page
-    current_lines = list(st.session_state.split_lines.get(pg, []))
+    if lines_on_page:
+        display_img = draw_lines_on_image(base_img, lines_on_page)
+    else:
+        display_img = base_img
 
-    # ── Interactive split-line editor ─────────────────────────────────────────
-    result = split_editor(
-        image_b64=img_b64,
-        lines=current_lines,
-        key=f"editor_{pg}"
-    )
+    st.image(display_img, use_container_width=True)
 
-    # Update session state from component
-    if result is not None:
-        new_lines = sorted(result)
-        if new_lines != current_lines:
-            if len(new_lines) > 0:
-                st.session_state.split_lines[pg] = new_lines
-            elif pg in st.session_state.split_lines:
-                del st.session_state.split_lines[pg]
+    # ── Add a new split line ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**Add a new split line**")
+    col_slider, col_add = st.columns([5, 1])
+    with col_slider:
+        y_pct = st.slider(
+            "Position (% from top of page)",
+            min_value=1, max_value=99, value=50,
+            key=f"new_line_slider_{pg}",
+            help="Drag to position, then click Add."
+        )
+    with col_add:
+        st.markdown("<div style='padding-top:28px'>", unsafe_allow_html=True)
+        if st.button("➕ Add", key=f"add_line_{pg}"):
+            y_frac = y_pct / 100.0
+            if pg not in st.session_state.split_lines:
+                st.session_state.split_lines[pg] = []
+            if y_frac not in st.session_state.split_lines[pg]:
+                st.session_state.split_lines[pg].append(y_frac)
+                st.session_state.split_lines[pg].sort()
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Total lines summary ───────────────────────────────────────────────────
+    # ── Existing lines on this page (move / remove) ──────────────────────────
+    if lines_on_page:
+        st.markdown(f"**Split lines on page {pg+1}:**")
+        for i, y_frac in enumerate(lines_on_page):
+            col_label, col_move, col_del = st.columns([2, 4, 1])
+            with col_label:
+                st.markdown(
+                    f'<div style="padding-top:10px">🟢 <b>Line {i+1}</b> — {int(y_frac*100)}%</div>',
+                    unsafe_allow_html=True
+                )
+            with col_move:
+                new_pct = st.slider(
+                    "Move",
+                    min_value=1, max_value=99,
+                    value=int(y_frac * 100),
+                    key=f"move_{pg}_{i}",
+                    label_visibility="collapsed"
+                )
+                new_frac = new_pct / 100.0
+                if new_frac != y_frac:
+                    st.session_state.split_lines[pg][i] = new_frac
+                    st.session_state.split_lines[pg].sort()
+                    st.rerun()
+            with col_del:
+                st.markdown("<div style='padding-top:4px'>", unsafe_allow_html=True)
+                if st.button("✕", key=f"del_{pg}_{i}"):
+                    st.session_state.split_lines[pg].remove(y_frac)
+                    if not st.session_state.split_lines[pg]:
+                        del st.session_state.split_lines[pg]
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Total lines summary ──────────────────────────────────────────────────
     total_lines = sum(len(v) for v in st.session_state.split_lines.values())
     st.markdown("---")
 
@@ -398,17 +321,17 @@ elif st.session_state.stage == "mark":
                 st.markdown(f"  - Page {p_idx+1} at {int(y*100)}% from top")
     else:
         st.info(
-            "No split lines added yet. Click on the page image to add lines, "
+            "No split lines added yet. Use the slider above to add lines, "
             "or proceed without splitting to download the original PDF."
         )
 
-    # ── Action buttons ────────────────────────────────────────────────────────
+    # ── Action buttons ───────────────────────────────────────────────────────
     col_reset, col_approve = st.columns([1, 3])
     with col_reset:
         if st.button("🔄 Start over"):
-            st.session_state.stage        = "upload"
-            st.session_state.pdf_bytes    = None
-            st.session_state.split_lines  = {}
+            st.session_state.stage       = "upload"
+            st.session_state.pdf_bytes   = None
+            st.session_state.split_lines = {}
             st.rerun()
     with col_approve:
         if total_lines == 0:
@@ -418,7 +341,6 @@ elif st.session_state.stage == "mark":
 
         if st.button(btn_label, type="primary"):
             if total_lines == 0:
-                # No split lines — return the original PDF as-is
                 st.session_state.split_results = [("Original.pdf", pdf_bytes)]
             else:
                 with st.spinner("Splitting PDF…"):
@@ -426,7 +348,6 @@ elif st.session_state.stage == "mark":
                     for p_idx, ys in st.session_state.split_lines.items():
                         for y in ys:
                             split_points.append((p_idx, y))
-
                     results = build_split_pdfs(pdf_bytes, split_points)
                     st.session_state.split_results = results
             st.session_state.stage = "done"
@@ -440,7 +361,6 @@ elif st.session_state.stage == "done":
     results = st.session_state.split_results
     st.success(f"✅ PDF split into **{len(results)}** file(s). Download individually or as a ZIP.")
 
-    # Individual downloads
     for filename, data in results:
         st.download_button(
             label=f"📄 {filename}",
@@ -450,7 +370,6 @@ elif st.session_state.stage == "done":
             key=f"dl_{filename}"
         )
 
-    # ZIP download
     st.markdown("---")
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -466,8 +385,8 @@ elif st.session_state.stage == "done":
 
     st.markdown("---")
     if st.button("🔄 Split another PDF"):
-        st.session_state.stage        = "upload"
-        st.session_state.pdf_bytes    = None
-        st.session_state.split_lines  = {}
+        st.session_state.stage         = "upload"
+        st.session_state.pdf_bytes     = None
+        st.session_state.split_lines   = {}
         st.session_state.split_results = []
         st.rerun()
