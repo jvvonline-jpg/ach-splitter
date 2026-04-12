@@ -7,12 +7,166 @@ import zipfile
 import fitz  # pymupdf
 import base64
 import os
+import tempfile
 
 st.set_page_config(page_title="ACH Remittance Splitter", layout="wide")
 
-# ── Custom component ─────────────────────────────────────────────────────────
-COMPONENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "component")
-_split_editor = components.declare_component("split_line_editor", path=COMPONENT_DIR)
+# ── Custom component (written to temp dir at runtime for portability) ─────────
+_COMPONENT_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: transparent; }
+  .instructions {
+    font-size: 13px; color: #64748b; padding: 8px 12px; text-align: center;
+    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
+    margin-bottom: 8px; line-height: 1.5;
+  }
+  .instructions strong { color: #334155; }
+  #wrapper {
+    position: relative; display: block; border: 1px solid #e2e8f0;
+    border-radius: 8px; overflow: hidden; background: #fff;
+  }
+  #page-image {
+    display: block; width: 100%; user-select: none;
+    -webkit-user-drag: none; pointer-events: none;
+  }
+  #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  .line-count {
+    font-size: 13px; color: #475569; padding: 8px 12px;
+    text-align: center; margin-top: 8px;
+  }
+  .line-count strong { color: #16a34a; }
+</style>
+</head>
+<body>
+<div class="instructions">
+  <strong>Click</strong> anywhere to add a split line &nbsp;&middot;&nbsp;
+  <strong>Drag</strong> a line to move it &nbsp;&middot;&nbsp;
+  <strong>Double-click</strong> a line to remove it
+</div>
+<div id="wrapper">
+  <img id="page-image" />
+  <canvas id="overlay"></canvas>
+</div>
+<div id="line-count" class="line-count"></div>
+<script>
+(function() {
+  var GRAB_THRESHOLD = 12;
+  var lines = [], dragging = null, hoveredLine = -1, lastSentJSON = "", imageLoaded = false;
+  var imgEl = document.getElementById('page-image');
+  var canvas = document.getElementById('overlay');
+  var ctx = canvas.getContext('2d');
+  var lineCountEl = document.getElementById('line-count');
+
+  function drawRoundRect(cx, x, y, w, h, r) {
+    cx.beginPath(); cx.moveTo(x+r,y); cx.lineTo(x+w-r,y);
+    cx.quadraticCurveTo(x+w,y,x+w,y+r); cx.lineTo(x+w,y+h-r);
+    cx.quadraticCurveTo(x+w,y+h,x+w-r,y+h); cx.lineTo(x+r,y+h);
+    cx.quadraticCurveTo(x,y+h,x,y+h-r); cx.lineTo(x,y+r);
+    cx.quadraticCurveTo(x,y,x+r,y); cx.closePath(); cx.fill();
+  }
+  function sendReady() { window.parent.postMessage({type:"streamlit:componentReady",apiVersion:1},"*"); }
+  function sendValue(v) {
+    var j=JSON.stringify(v); if(j===lastSentJSON)return; lastSentJSON=j;
+    window.parent.postMessage({type:"streamlit:setComponentValue",value:v},"*");
+  }
+  function setFrameHeight(h) { window.parent.postMessage({type:"streamlit:setFrameHeight",height:h},"*"); }
+
+  window.addEventListener("message",function(event){
+    if(!event.data||event.data.type!=="streamlit:render")return;
+    var args=event.data.args;
+    lines=args.lines?args.lines.slice():[];
+    lastSentJSON=JSON.stringify(lines);
+    var b64=args.image_b64; if(!b64)return;
+    var newSrc="data:image/png;base64,"+b64;
+    if(imgEl.src!==newSrc){
+      imgEl.onload=function(){
+        imageLoaded=true; resizeCanvas(); drawLines(); updateLineCount();
+        setTimeout(function(){setFrameHeight(document.body.scrollHeight+10);},60);
+      };
+      imgEl.src=newSrc;
+    } else { resizeCanvas(); drawLines(); updateLineCount(); }
+  });
+
+  function resizeCanvas(){if(!imgEl.naturalWidth)return;canvas.width=imgEl.naturalWidth;canvas.height=imgEl.naturalHeight;}
+  function getMouseY(e){var r=canvas.getBoundingClientRect();return(e.clientY-r.top)*(canvas.height/r.height);}
+  function findNearestLine(mouseY){
+    var best=-1,bestDist=Infinity;
+    for(var i=0;i<lines.length;i++){var d=Math.abs(mouseY-lines[i]*canvas.height);if(d<bestDist){bestDist=d;best=i;}}
+    var r=canvas.getBoundingClientRect();
+    return bestDist<=GRAB_THRESHOLD*(canvas.height/r.height)?best:-1;
+  }
+  function drawLines(){
+    if(!imageLoaded)return; ctx.clearRect(0,0,canvas.width,canvas.height);
+    for(var i=0;i<lines.length;i++){
+      var y=lines[i]*canvas.height, isA=(i===hoveredLine)||(i===dragging);
+      ctx.beginPath();ctx.setLineDash([18,10]);
+      ctx.strokeStyle=isA?'#dc2626':'#22c55e';ctx.lineWidth=isA?4:3;
+      ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke();ctx.setLineDash([]);
+      var pct=Math.round(lines[i]*100),label=isA?'\u2715  '+pct+'%':pct+'%';
+      ctx.font='bold 13px -apple-system,BlinkMacSystemFont,sans-serif';
+      var tw=ctx.measureText(label).width,lx=canvas.width-tw-24,ly=y-10;
+      if(ly<4)ly=y+22;
+      ctx.fillStyle=isA?'rgba(220,38,38,0.9)':'rgba(34,197,94,0.9)';
+      drawRoundRect(ctx,lx-6,ly-13,tw+12,20,4);
+      ctx.fillStyle='#fff';ctx.fillText(label,lx,ly+2);
+    }
+  }
+  function updateLineCount(){
+    lineCountEl.innerHTML=lines.length===0?'No split lines on this page. Click on the image to add one.':
+      '<strong>'+lines.length+'</strong> split line'+(lines.length>1?'s':'')+' on this page';
+  }
+
+  var clickStartY=null,didDrag=false;
+  canvas.addEventListener('mousedown',function(e){
+    e.preventDefault();var my=getMouseY(e);clickStartY=my;didDrag=false;
+    var idx=findNearestLine(my);if(idx>=0)dragging=idx;
+  });
+  canvas.addEventListener('mousemove',function(e){
+    e.preventDefault();var my=getMouseY(e);
+    if(dragging!==null){didDrag=true;lines[dragging]=Math.max(0.01,Math.min(0.99,my/canvas.height));canvas.style.cursor='grabbing';drawLines();}
+    else{var idx=findNearestLine(my);hoveredLine=idx;canvas.style.cursor=idx>=0?'ns-resize':'crosshair';drawLines();}
+  });
+  canvas.addEventListener('mouseup',function(e){
+    var my=getMouseY(e);
+    if(dragging!==null){lines.sort(function(a,b){return a-b;});dragging=null;hoveredLine=-1;sendValue(lines.slice());drawLines();updateLineCount();}
+    else if(!didDrag&&clickStartY!==null){var idx=findNearestLine(my);if(idx<0){var yF=Math.max(0.01,Math.min(0.99,my/canvas.height));lines.push(yF);lines.sort(function(a,b){return a-b;});sendValue(lines.slice());drawLines();updateLineCount();}}
+    clickStartY=null;didDrag=false;
+  });
+  canvas.addEventListener('mouseleave',function(e){
+    if(dragging!==null){lines.sort(function(a,b){return a-b;});dragging=null;sendValue(lines.slice());drawLines();updateLineCount();}
+    hoveredLine=-1;canvas.style.cursor='crosshair';drawLines();clickStartY=null;didDrag=false;
+  });
+  canvas.addEventListener('dblclick',function(e){
+    e.preventDefault();var my=getMouseY(e),idx=findNearestLine(my);
+    if(idx>=0){lines.splice(idx,1);hoveredLine=-1;dragging=null;sendValue(lines.slice());drawLines();updateLineCount();}
+  });
+  canvas.addEventListener('contextmenu',function(e){e.preventDefault();});
+
+  var touchStartY=null,touchDragging=null,touchDidDrag=false;
+  function getTouchY(e){var t=e.touches[0]||e.changedTouches[0],r=canvas.getBoundingClientRect();return(t.clientY-r.top)*(canvas.height/r.height);}
+  canvas.addEventListener('touchstart',function(e){e.preventDefault();var my=getTouchY(e);touchStartY=my;touchDidDrag=false;var idx=findNearestLine(my);if(idx>=0){touchDragging=idx;dragging=idx;}},{passive:false});
+  canvas.addEventListener('touchmove',function(e){e.preventDefault();var my=getTouchY(e);if(touchDragging!==null){touchDidDrag=true;lines[touchDragging]=Math.max(0.01,Math.min(0.99,my/canvas.height));dragging=touchDragging;drawLines();}},{passive:false});
+  canvas.addEventListener('touchend',function(e){e.preventDefault();var my=getTouchY(e);if(touchDragging!==null){lines.sort(function(a,b){return a-b;});touchDragging=null;dragging=null;sendValue(lines.slice());drawLines();updateLineCount();}else if(!touchDidDrag&&touchStartY!==null){var idx=findNearestLine(my);if(idx<0){var yF=Math.max(0.01,Math.min(0.99,my/canvas.height));lines.push(yF);lines.sort(function(a,b){return a-b;});sendValue(lines.slice());drawLines();updateLineCount();}}touchStartY=null;touchDidDrag=false;},{passive:false});
+
+  sendReady();
+})();
+</script>
+</body>
+</html>"""
+
+# Write component HTML to a stable temp directory
+_component_dir = os.path.join(tempfile.gettempdir(), "st_split_line_editor")
+os.makedirs(_component_dir, exist_ok=True)
+_index_path = os.path.join(_component_dir, "index.html")
+with open(_index_path, "w") as _f:
+    _f.write(_COMPONENT_HTML)
+
+_split_editor = components.declare_component("split_line_editor", path=_component_dir)
 
 
 def split_editor(image_b64, lines, key=None):
