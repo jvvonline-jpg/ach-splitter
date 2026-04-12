@@ -1,3 +1,4 @@
-streamlit
-pdfplumber
-pypdf
+streamlit>=1.32.0
+pypdf>=4.0.0
+pymupdf>=1.24.0
+Pillow>=10.0.0
