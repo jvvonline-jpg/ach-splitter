@@ -1,13 +1,24 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from pypdf import PdfReader, PdfWriter
 import io
 import re
 import zipfile
 import fitz  # pymupdf
 import base64
-from PIL import Image
+import os
 
 st.set_page_config(page_title="ACH Remittance Splitter", layout="wide")
+
+# ── Custom component ─────────────────────────────────────────────────────────
+COMPONENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "component")
+_split_editor = components.declare_component("split_line_editor", path=COMPONENT_DIR)
+
+
+def split_editor(image_b64, lines, key=None):
+    """Render the interactive split-line editor. Returns updated list of y-fractions."""
+    return _split_editor(image_b64=image_b64, lines=lines, key=key, default=lines)
+
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -174,11 +185,6 @@ if st.session_state.stage == "upload":
 # ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.stage == "mark":
     st.markdown('<div class="step-badge">Step 2 — Mark split lines</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="info-box">👆 Use the slider to place a <b>green dashed split line</b> on the current page. '
-        'Add as many lines as needed, then navigate pages to add more.</div>',
-        unsafe_allow_html=True
-    )
 
     pdf_bytes   = st.session_state.pdf_bytes
     total_pages = st.session_state.total_pages
@@ -191,96 +197,58 @@ elif st.session_state.stage == "mark":
             st.session_state.current_page -= 1
             st.rerun()
     with col_info:
-        st.markdown(f"<div style='text-align:center;font-weight:500;padding-top:6px'>Page {pg+1} of {total_pages}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='text-align:center;font-weight:500;padding-top:6px'>"
+            f"Page {pg+1} of {total_pages}</div>",
+            unsafe_allow_html=True
+        )
     with col_next:
         if st.button("Next ➡", disabled=(pg == total_pages - 1)):
             st.session_state.current_page += 1
             st.rerun()
 
-    # Render current page
+    # Render current page as base64 PNG
     img_bytes, img_w, img_h = render_page(pdf_bytes, pg)
+    img_b64 = base64.b64encode(img_bytes).decode()
 
-    # Draw existing split lines on top using PIL
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    # Get current lines for this page
+    current_lines = list(st.session_state.split_lines.get(pg, []))
 
-    from PIL import ImageDraw
-    draw = ImageDraw.Draw(overlay)
-
-    lines_on_page = sorted(st.session_state.split_lines.get(pg, []))
-    for y_frac in lines_on_page:
-        y_px = int(y_frac * img.height)
-        # Draw dashed green line
-        dash_len = 18
-        gap_len  = 10
-        x = 0
-        while x < img.width:
-            draw.line([(x, y_px), (min(x + dash_len, img.width), y_px)],
-                      fill=(34, 197, 94, 220), width=3)
-            x += dash_len + gap_len
-
-    img = Image.alpha_composite(img, overlay).convert("RGB")
-
-    # Convert back to bytes for display
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-    # Show image
-    st.markdown(
-        f'<img src="data:image/png;base64,{img_b64}" '
-        f'style="width:100%;border:1px solid #e2e8f0;border-radius:8px"/>',
-        unsafe_allow_html=True
+    # ── Interactive split-line editor ─────────────────────────────────────────
+    result = split_editor(
+        image_b64=img_b64,
+        lines=current_lines,
+        key=f"editor_{pg}"
     )
 
-    # ── Add a split line via slider ───────────────────────────────────────────
-    st.markdown("---")
-    col_slider, col_add = st.columns([4, 1])
-    with col_slider:
-        y_pct = st.slider(
-            "📍 Split line position (% from top of page)",
-            min_value=1, max_value=99, value=50,
-            help="Drag to position the green dashed line, then click Add."
-        )
-    with col_add:
-        st.markdown("<div style='padding-top:28px'>", unsafe_allow_html=True)
-        if st.button("➕ Add line"):
-            y_frac = y_pct / 100.0
-            if pg not in st.session_state.split_lines:
-                st.session_state.split_lines[pg] = []
-            if y_frac not in st.session_state.split_lines[pg]:
-                st.session_state.split_lines[pg].append(y_frac)
-                st.session_state.split_lines[pg].sort()
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Lines on this page ────────────────────────────────────────────────────
-    if lines_on_page:
-        st.markdown(f"**Lines on page {pg+1}:**")
-        for i, y_frac in enumerate(lines_on_page):
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(
-                    f'<div class="split-line-row">🟢 Split line {i+1} — at {int(y_frac*100)}% from top</div>',
-                    unsafe_allow_html=True
-                )
-            with c2:
-                if st.button("✕ Remove", key=f"del_{pg}_{i}"):
-                    st.session_state.split_lines[pg].remove(y_frac)
-                    if not st.session_state.split_lines[pg]:
-                        del st.session_state.split_lines[pg]
-                    st.rerun()
+    # Update session state from component
+    if result is not None:
+        new_lines = sorted(result)
+        if new_lines != current_lines:
+            if len(new_lines) > 0:
+                st.session_state.split_lines[pg] = new_lines
+            elif pg in st.session_state.split_lines:
+                del st.session_state.split_lines[pg]
 
     # ── Total lines summary ───────────────────────────────────────────────────
     total_lines = sum(len(v) for v in st.session_state.split_lines.values())
     st.markdown("---")
 
     if total_lines > 0:
-        st.markdown(f"**Total split lines across all pages: {total_lines}** → will produce **{total_lines + 1}** output file(s).")
+        st.markdown(
+            f"**Total split lines across all pages: {total_lines}** "
+            f"→ will produce **{total_lines + 1}** output file(s)."
+        )
         for p_idx, ys in sorted(st.session_state.split_lines.items()):
             for y in ys:
                 st.markdown(f"  - Page {p_idx+1} at {int(y*100)}% from top")
+    else:
+        st.info(
+            "No split lines added yet. Click on the page image to add lines, "
+            "or proceed without splitting to download the original PDF."
+        )
 
+    # ── Action buttons ────────────────────────────────────────────────────────
     col_reset, col_approve = st.columns([1, 3])
     with col_reset:
         if st.button("🔄 Start over"):
@@ -290,9 +258,15 @@ elif st.session_state.stage == "mark":
             st.rerun()
     with col_approve:
         if total_lines == 0:
-            st.warning("Add at least one split line before approving.")
+            btn_label = "⏩ Skip Splitting — Download Original"
         else:
-            if st.button("✅ Approve & Split PDF", type="primary"):
+            btn_label = "✅ Approve & Split PDF"
+
+        if st.button(btn_label, type="primary"):
+            if total_lines == 0:
+                # No split lines — return the original PDF as-is
+                st.session_state.split_results = [("Original.pdf", pdf_bytes)]
+            else:
                 with st.spinner("Splitting PDF…"):
                     split_points = []
                     for p_idx, ys in st.session_state.split_lines.items():
@@ -301,8 +275,8 @@ elif st.session_state.stage == "mark":
 
                     results = build_split_pdfs(pdf_bytes, split_points)
                     st.session_state.split_results = results
-                    st.session_state.stage = "done"
-                    st.rerun()
+            st.session_state.stage = "done"
+            st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 3 — DOWNLOAD
